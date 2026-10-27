@@ -244,13 +244,24 @@ public class PlanValidator {
             }
         }
 
-        // 6. Room Type Integrity & Policy Overrides
-        // 6. Room Type Integrity & Policy Overrides (Lab Hours Adjustment Rule)
+        // 6. Room Type Integrity & Policy Overrides (Lab Hours Adjustment Rule & Temporary Extra Venues)
         for (EffectiveSession es : effectiveSessions) {
             if (es.sessionType() == TimetableSession.SessionType.LAB) {
                 if (es.room() != null && es.room().getRoomType() != Room.RoomType.LAB) {
-                    // Lab sessions must be conducted in labs only, unless a Lab Hours Adjustment Rule permits classrooms
-                    boolean permitted = roomPolicies.stream().anyMatch(rp -> {
+                    // Check 1: Is this session an EDI / Seminar / Project presentation course?
+                    String subjCode = (es.originalSession().getSubject() != null && es.originalSession().getSubject().getCode() != null)
+                            ? es.originalSession().getSubject().getCode().toUpperCase() : "";
+                    boolean isSeminarOrProject = subjCode.contains("EDI") || subjCode.contains("SEM")
+                            || subjCode.contains("PROJ") || subjCode.contains("PBL");
+
+                    // Check 2: Was this room explicitly added as an approved Temporary Extra Venue for this date?
+                    boolean isExtraRoomForDate = disruptions.stream().anyMatch(d ->
+                            d.getKind() == Disruption.DisruptionKind.EXTRA_ROOM &&
+                            d.getRoom() != null &&
+                            d.getRoom().getId().equals(es.room().getId()));
+
+                    // Check 3: Does a Lab Hours Adjustment Rule policy permit classrooms / other venues?
+                    boolean permittedByPolicy = roomPolicies.stream().anyMatch(rp -> {
                         if (rp.getAllowRoomTypes() == null) return false;
                         boolean typeMatch = rp.getSessionType() == null || rp.getSessionType() == TimetableSession.SessionType.LAB;
                         if (!typeMatch) return false;
@@ -266,15 +277,15 @@ public class PlanValidator {
                         }
 
                         for (String art : rp.getAllowRoomTypes()) {
-                            if ("CLASSROOM".equalsIgnoreCase(art)) return true;
+                            if ("CLASSROOM".equalsIgnoreCase(art) || "OTHER".equalsIgnoreCase(art)) return true;
                         }
                         return false;
                     });
 
-                    if (!permitted) {
+                    if (!isSeminarOrProject && !isExtraRoomForDate && !permittedByPolicy) {
                         newClashes++;
                         findings.add(createFinding("LAB_IN_NON_LAB_ROOM", "ERROR", false,
-                                String.format("LAB practical session %d (%s) placed in non-lab room %s (%s). Lab sessions must be conducted in labs only, unless Lab Hours Adjustment Rule is applied.",
+                                String.format("LAB practical session %d (%s) placed in non-lab room %s (%s). Lab sessions must be conducted in labs only, unless Lab Hours Adjustment Rule is applied or temporary extra room is authorized.",
                                         es.sessionId(), es.originalSession().getSubject().getCode(),
                                         es.room().getCode(), es.room().getRoomType()),
                                 es.sessionId(), null));
