@@ -1,0 +1,70 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* RSCOE Crimson Brand */
+    --primary: 351 69% 36%;           /* #9B1C2E */
+    --primary-foreground: 0 0% 100%;
+    --primary-hover: 350 70% 26%;     /* #6F1423 */
+    --primary-tint: 351 70% 96%;
+    --primary-border: 351 60% 85%;
+    --header-deep: 348 71% 15%;       /* #3F0B15 */
+
+    /* Neutrals */
+    --canvas: 20 14% 96%;            /* #F6F4F3 Warm white */
+    --surface: 0 0% 100%;            /* #FFFFFF */
+    --ink: 213 14% 13%;              /* #1B1F24 High contrast dark */
+    --muted: 216 10% 40%;            /* #5B6470 */
+    --muted-foreground: 216 10% 45%;
+    --border: 220 13% 91%;           /* #E5E7EB */
+
+    /* Status */
+    --success: 153 60% 36%;
+    --success-bg: 152 70% 96%;
+    --warning: 38 92% 50%;
+    --warning-bg: 48 100% 96%;
+    --danger: 0 74% 50%;
+    --danger-bg: 0 100% 97%;
+    --info: 212 96% 45%;
+    --info-bg: 214 100% 97%;
+
+    --background: 20 14% 96%;
+    --foreground: 213 14% 13%;
+    --card: 0 0% 100%;
+    --card-foreground: 213 14% 13%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 213 14% 13%;
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 213 14% 13%;
+    --accent: 351 70% 96%;
+    --accent-foreground: 351 69% 36%;
+    --destructive: 0 74% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --input: 220 13% 88%;
+    --ring: 351 69% 36%;
+  }
+
+  body {
+    background-color: hsl(var(--canvas));
+    color: hsl(var(--ink));
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}

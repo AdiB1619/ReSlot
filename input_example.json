@@ -1,0 +1,52 @@
+{
+  "date": "2026-10-22",
+  "master": { "file": "Updated_TT.pdf" },
+
+  "classrooms": [
+    { "id": "A-216" }, { "id": "A1-201" }, { "id": "A1-202" },
+    { "id": "A1-203" }, { "id": "A1-215" }, { "id": "B-216" }
+  ],
+  "labs": [
+    { "id": "A-209", "name": "Computer Vision Lab", "short": "CVL" },
+    { "id": "A-210", "name": "ML / AI-ML Lab", "short": "MLL", "aliases": ["ML", "AML"] },
+    { "id": "A1-208", "name": "PG Lab", "short": "PGL" },
+    { "id": "A1-209", "name": "Innovation Lab", "short": "INL" },
+    { "id": "A1-113", "name": "Cyber Security Lab", "short": "CSL" },
+    { "id": "A-211", "name": "Project Lab", "short": "PL" },
+    { "id": "A-212", "name": "Research Lab", "short": "RL" },
+    { "id": "B-108", "name": "MAC Lab", "short": "MACL" },
+    { "id": "A1-301", "name": "Data Science Lab", "short": "DSL" },
+    { "id": "KRC", "name": "Knowledge Resource Centre", "short": "KRC" }
+  ],
+  "other_rooms": [],
+  "lab_blocks": ["09:00-11:00", "11:15-13:15", "14:00-16:00"],
+
+  "unavailable": [
+    { "room": "A-212", "from": "09:00", "to": "11:00", "reason": "power maintenance" }
+  ],
+  "extra_rooms": {
+    "classrooms": [ { "id": "X-1", "from": "09:00", "to": "17:00" } ],
+    "labs": []
+  },
+  "faculty_unavailable": [
+    { "faculty": "SW", "from": "09:00", "to": "17:00", "reason": "on leave" }
+  ],
+
+  "room_rules": [
+    {
+      "scope": { "level": "SY" },
+      "sessions": "LAB",
+      "allow": ["CLASSROOM"],
+      "layout": "ONE_ROOM_PER_BATCH",
+      "reason": "labs needed for an exam"
+    },
+    {
+      "scope": { "division": "BE-A" },
+      "sessions": "LAB",
+      "allow": ["CLASSROOM"],
+      "layout": "MERGE_BATCHES",
+      "confirmed_by": "hod",
+      "reason": "theory-style session, one classroom for all batches"
+    }
+  ]
+}

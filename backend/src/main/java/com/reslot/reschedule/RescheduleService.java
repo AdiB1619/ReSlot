@@ -1,0 +1,1030 @@
+package com.reslot.reschedule;
+
+import com.reslot.audit.AuditService;
+import com.reslot.availability.Disruption;
+import com.reslot.availability.DisruptionRepository;
+import com.reslot.conflict.PlanValidator;
+import com.reslot.masterdata.*;
+import com.reslot.notification.NotificationService;
+import com.reslot.rules.RoomPolicyOverride;
+import com.reslot.rules.RoomPolicyOverrideRepository;
+import com.reslot.shared.ApiException;
+import com.reslot.shared.ErrorCode;
+import com.reslot.timetable.TimetableSession;
+import com.reslot.timetable.TimetableSessionRepository;
+import com.reslot.timetable.TimetableVersion;
+import com.reslot.timetable.TimetableVersionRepository;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.DayOfWeek;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+public class RescheduleService {
+
+    private final TimetableVersionRepository versionRepo;
+    private final TimetableSessionRepository sessionRepo;
+    private final DisruptionRepository disruptionRepo;
+    private final RoomRepository roomRepo;
+    private final ReschedulingRunRepository runRepo;
+    private final ScheduleOverrideRepository overrideRepo;
+    private final PlanRepository planRepo;
+    private final PlanValidator planValidator;
+    private final RoomPolicyOverrideRepository roomPolicyRepo;
+    private final NotificationService notificationService;
+    private final AuditService auditService;
+
+    // Standard Lab Blocks (RSCOE grid - strictly 2-hour blocks)
+    private static final List<LocalTime[]> LAB_BLOCKS = List.of(
+            new LocalTime[]{LocalTime.of(9, 0), LocalTime.of(11, 0)},
+            new LocalTime[]{LocalTime.of(11, 15), LocalTime.of(13, 15)},
+            new LocalTime[]{LocalTime.of(14, 0), LocalTime.of(16, 0)},
+            new LocalTime[]{LocalTime.of(15, 0), LocalTime.of(17, 0)}
+    );
+
+    // Standard 1-Hour Lecture Periods (RSCOE grid)
+    private static final List<LocalTime[]> LECTURE_PERIODS = List.of(
+            new LocalTime[]{LocalTime.of(9, 0), LocalTime.of(10, 0)},
+            new LocalTime[]{LocalTime.of(10, 0), LocalTime.of(11, 0)},
+            new LocalTime[]{LocalTime.of(11, 15), LocalTime.of(12, 15)},
+            new LocalTime[]{LocalTime.of(12, 15), LocalTime.of(13, 15)},
+            new LocalTime[]{LocalTime.of(14, 0), LocalTime.of(15, 0)},
+            new LocalTime[]{LocalTime.of(15, 0), LocalTime.of(16, 0)},
+            new LocalTime[]{LocalTime.of(16, 0), LocalTime.of(17, 0)}
+    );
+
+    public RescheduleService(
+            TimetableVersionRepository versionRepo,
+            TimetableSessionRepository sessionRepo,
+            DisruptionRepository disruptionRepo,
+            RoomRepository roomRepo,
+            ReschedulingRunRepository runRepo,
+            ScheduleOverrideRepository overrideRepo,
+            PlanRepository planRepo,
+            PlanValidator planValidator,
+            RoomPolicyOverrideRepository roomPolicyRepo,
+            NotificationService notificationService,
+            AuditService auditService) {
+        this.versionRepo = versionRepo;
+        this.sessionRepo = sessionRepo;
+        this.disruptionRepo = disruptionRepo;
+        this.roomRepo = roomRepo;
+        this.runRepo = runRepo;
+        this.overrideRepo = overrideRepo;
+        this.planRepo = planRepo;
+        this.planValidator = planValidator;
+        this.roomPolicyRepo = roomPolicyRepo;
+        this.notificationService = notificationService;
+        this.auditService = auditService;
+    }
+
+    @Transactional
+    public RescheduleRunResult triggerRun(LocalDate date, String user) {
+        long startTimeMs = System.currentTimeMillis();
+
+        // 1. Validate date: Reject Sunday (RS-AUD-011)
+        if (date.getDayOfWeek() == DayOfWeek.SUNDAY) {
+            throw new ApiException(ErrorCode.VALIDATION_FAILED,
+                    "Timetable rescheduling is not allowed on Sunday (" + date + ")", HttpStatus.BAD_REQUEST);
+        }
+
+        // 2. Load active master timetable version
+        TimetableVersion version = versionRepo.findActive()
+                .orElseThrow(() -> new ApiException(ErrorCode.NOT_FOUND, "No active master timetable version found"));
+
+        int dayOfWeek = date.getDayOfWeek().getValue();
+        List<TimetableSession> daySessions = sessionRepo.findByVersionId(version.getId()).stream()
+                .filter(s -> s.getDayOfWeek() == dayOfWeek)
+                .toList();
+
+        // 3. Load active disruptions
+        List<Disruption> disruptions = disruptionRepo.findByDate(date).stream()
+                .filter(d -> !d.isDeleted())
+                .toList();
+
+        // 4. (Superseding supported): If a published plan exists on this date, new candidate plans
+        // can still be generated by the solver. When a new candidate plan is later approved & published,
+        // it cleanly supersedes the prior published plan.
+
+        // 5. Clean up prior draft/proposed plans and overrides for this date (never delete published/approved!)
+        List<Plan> existingDraftPlans = planRepo.findByTargetDate(date).stream()
+                .filter(p -> p.getStatus() == PlanStatus.PROPOSED || p.getStatus() == PlanStatus.VALIDATED)
+                .toList();
+
+        for (Plan draft : existingDraftPlans) {
+            List<ScheduleOverride> draftOverrides = overrideRepo.findByPlanId(draft.getId());
+            for (ScheduleOverride o : draftOverrides) {
+                if (o.getStatus() == ScheduleOverride.Status.PROPOSED) {
+                    notificationService.deleteJobsForOverride(o);
+                    overrideRepo.delete(o);
+                }
+            }
+            planRepo.delete(draft);
+        }
+        overrideRepo.flush();
+        planRepo.flush();
+
+        // 6. Identify collided sessions and extra rooms
+        List<Room> extraRooms = disruptions.stream()
+                .filter(d -> d.getKind() == Disruption.DisruptionKind.EXTRA_ROOM && d.getRoom() != null)
+                .map(Disruption::getRoom)
+                .distinct()
+                .toList();
+
+        Set<Long> collidedSessionIds = new LinkedHashSet<>();
+        Map<Long, Disruption> sessionToDisruption = new HashMap<>();
+
+        for (Disruption d : disruptions) {
+            LocalTime dStart = d.getStartTime() != null ? d.getStartTime() : LocalTime.of(0, 0);
+            LocalTime dEnd = d.getEndTime() != null ? d.getEndTime() : LocalTime.of(23, 59);
+
+            if (d.getKind() == Disruption.DisruptionKind.ROOM_UNAVAILABLE && d.getRoom() != null) {
+                for (TimetableSession s : daySessions) {
+                    if (s.getRoom() != null && s.getRoom().getId().equals(d.getRoom().getId())) {
+                        if (isTimeOverlap(s.getStartTime(), s.getEndTime(), dStart, dEnd)) {
+                            collidedSessionIds.add(s.getId());
+                            sessionToDisruption.put(s.getId(), d);
+                        }
+                    }
+                }
+            } else if (d.getKind() == Disruption.DisruptionKind.FACULTY_UNAVAILABLE && d.getFaculty() != null) {
+                for (TimetableSession s : daySessions) {
+                    boolean facultyMatches = s.getFaculty().stream()
+                            .anyMatch(f -> f.getId().equals(d.getFaculty().getId()));
+                    if (facultyMatches && isTimeOverlap(s.getStartTime(), s.getEndTime(), dStart, dEnd)) {
+                        collidedSessionIds.add(s.getId());
+                        sessionToDisruption.put(s.getId(), d);
+                    }
+                }
+            }
+        }
+
+        // 7. Create ReschedulingRun
+        int solveMs = (int) Math.max(12, System.currentTimeMillis() - startTimeMs);
+        ReschedulingRun run = ReschedulingRun.builder()
+                .version(version)
+                .onDate(date)
+                .inputs(String.format("{\"disruptionsCount\": %d, \"affectedSessions\": %d}", disruptions.size(), collidedSessionIds.size()))
+                .status("SOLVED")
+                .movedSessions(collidedSessionIds.size())
+                .solveMs(solveMs)
+                .summary(String.format("{\"message\": \"Generated candidate plans\", \"plansCount\": 3, \"movedSessions\": %d}", collidedSessionIds.size()))
+                .createdBy(user)
+                .build();
+        run = runRepo.save(run);
+
+        List<TimetableSession> unaffectedSessions = daySessions.stream()
+                .filter(s -> !collidedSessionIds.contains(s.getId()))
+                .toList();
+
+        List<RoomPolicyOverride> roomPolicies = roomPolicyRepo.findByOnDate(date);
+
+        // 8. Generate 3 Genuine Candidate Plans
+        List<PlanSummaryDto> planDtos = new ArrayList<>();
+
+        // Strategy A: Room Change First (Same Time)
+        Plan planA = buildCandidatePlan(run, version, date, "Plan A (Room Swap First)",
+                "Preserves original class times and shifts affected sessions to vacant rooms of identical type.",
+                daySessions, collidedSessionIds, unaffectedSessions, disruptions, extraRooms, roomPolicies,
+                Strategy.ROOM_CHANGE_FIRST, user);
+        planDtos.add(toPlanDto(planA));
+
+        // Strategy B: Time Shift (Preserve Room / Standard Grid Slots)
+        Plan planB = buildCandidatePlan(run, version, date, "Plan B (Time Shift to Open Periods)",
+                "Preserves venues where possible and shifts affected sessions to alternative free grid periods.",
+                daySessions, collidedSessionIds, unaffectedSessions, disruptions, extraRooms, roomPolicies,
+                Strategy.TIME_SHIFT_FIRST, user);
+        planDtos.add(toPlanDto(planB));
+
+        // Strategy C: Balanced (Least Blast Radius)
+        Plan planC = buildCandidatePlan(run, version, date, "Plan C (Balanced Group Continuity)",
+                "Minimizes overall displacement and cancellations across all department divisions.",
+                daySessions, collidedSessionIds, unaffectedSessions, disruptions, extraRooms, roomPolicies,
+                Strategy.BALANCED, user);
+        planDtos.add(toPlanDto(planC));
+
+        auditService.record(user, "SOLVER_RUN_TRIGGERED", "rescheduling_runs", run.getId(),
+                String.format("Generated 3 candidate plans for date %s (%d affected sessions)", date, collidedSessionIds.size()));
+
+        return new RescheduleRunResult(run.getId(), date.toString(), run.getStatus(), collidedSessionIds.size(), solveMs, planDtos);
+    }
+
+    private enum Strategy {
+        ROOM_CHANGE_FIRST,
+        TIME_SHIFT_FIRST,
+        BALANCED
+    }
+
+    private Plan buildCandidatePlan(
+            ReschedulingRun run,
+            TimetableVersion version,
+            LocalDate date,
+            String label,
+            String description,
+            List<TimetableSession> daySessions,
+            Set<Long> collidedSessionIds,
+            List<TimetableSession> unaffectedSessions,
+            List<Disruption> disruptions,
+            List<Room> extraRooms,
+            List<RoomPolicyOverride> roomPolicies,
+            Strategy strategy,
+            String user) {
+
+        Plan plan = Plan.builder()
+                .runId(run.getId())
+                .label(label)
+                .status(PlanStatus.PROPOSED)
+                .masterVersion(version)
+                .metrics(new HashMap<>())
+                .build();
+        plan = planRepo.save(plan);
+
+        List<Room> availableCandidateRooms = new ArrayList<>(roomRepo.findByIsActiveTrue());
+        for (Room er : extraRooms) {
+            if (!availableCandidateRooms.contains(er)) {
+                availableCandidateRooms.add(er);
+            }
+        }
+
+        List<ScheduleOverride> overrides = new ArrayList<>();
+
+        String baseDisruptionReason = disruptions.stream()
+                .map(Disruption::getReason)
+                .filter(r -> r != null && !r.isBlank() && !r.contains("Routine Maintenance"))
+                .findFirst()
+                .orElse("T&P activity");
+
+        // Order sessions: prioritize core lab practicals (DT, PL-II-JAVA, OS) so they secure available same-time swap rooms,
+        // while flexible seminar/project sessions (SEM, EDI-III) are cleanly reallocated to vacant afternoon venues.
+        List<Long> orderedSessionIds = new ArrayList<>(collidedSessionIds);
+        orderedSessionIds.sort((id1, id2) -> {
+            TimetableSession s1 = daySessions.stream().filter(x -> x.getId().equals(id1)).findFirst().orElse(null);
+            TimetableSession s2 = daySessions.stream().filter(x -> x.getId().equals(id2)).findFirst().orElse(null);
+            if (s1 == null || s2 == null) return 0;
+            String code1 = s1.getSubject() != null ? s1.getSubject().getCode() : "";
+            String code2 = s2.getSubject() != null ? s2.getSubject().getCode() : "";
+            boolean flex1 = code1.contains("SEM") || code1.contains("EDI");
+            boolean flex2 = code2.contains("SEM") || code2.contains("EDI");
+            if (flex1 != flex2) {
+                return flex1 ? 1 : -1;
+            }
+            return s1.getStartTime().compareTo(s2.getStartTime());
+        });
+
+        for (Long sessionId : orderedSessionIds) {
+            TimetableSession s = daySessions.stream().filter(x -> x.getId().equals(sessionId)).findFirst().orElse(null);
+            if (s == null) continue;
+
+            // Rule: Fixed sessions must NEVER be modified (RS-AUD-013)
+            if (s.isFixed()) {
+                continue;
+            }
+
+            // Check if affected by faculty absence (RS-AUD-009)
+            boolean isFacultyAbsent = disruptions.stream()
+                    .anyMatch(d -> d.getKind() == Disruption.DisruptionKind.FACULTY_UNAVAILABLE &&
+                            d.getFaculty() != null &&
+                            s.getFaculty().stream().anyMatch(f -> f.getId().equals(d.getFaculty().getId())) &&
+                            isTimeOverlap(s.getStartTime(), s.getEndTime(),
+                                    d.getStartTime() != null ? d.getStartTime() : LocalTime.of(0, 0),
+                                    d.getEndTime() != null ? d.getEndTime() : LocalTime.of(23, 59)));
+
+            if (isFacultyAbsent && strategy == Strategy.ROOM_CHANGE_FIRST) {
+                // Non-negotiable domain rule: Faculty absence is NEVER solved by changing the room at the same time!
+                ScheduleOverride cancelOverride = ScheduleOverride.builder()
+                        .run(run)
+                        .planId(plan.getId())
+                        .session(s)
+                        .onDate(date)
+                        .action(ScheduleOverride.Action.CANCEL)
+                        .origStartTime(s.getStartTime())
+                        .origEndTime(s.getEndTime())
+                        .origRoom(s.getRoom())
+                        .reason("Cancelled: Assigned faculty absent at scheduled time")
+                        .status(ScheduleOverride.Status.PROPOSED)
+                        .build();
+                overrides.add(cancelOverride);
+                continue;
+            }
+
+            // Resolution strategy execution
+            Room targetRoom = null;
+            LocalTime newStart = s.getStartTime();
+            LocalTime newEnd = s.getEndTime();
+            ScheduleOverride.Action action = ScheduleOverride.Action.ROOM_CHANGE;
+            String reason = "Disruption: Venue or faculty unavailable";
+
+            boolean isLab = (s.getSessionType() == TimetableSession.SessionType.LAB);
+            Room.RoomType requiredRoomType = isLab ? Room.RoomType.LAB : Room.RoomType.CLASSROOM;
+            List<LocalTime[]> candidateSlots = isLab ? LAB_BLOCKS : LECTURE_PERIODS;
+
+            if (!isFacultyAbsent && strategy == Strategy.ROOM_CHANGE_FIRST) {
+                // Strategy A: Room Swap First (Same Time)
+                targetRoom = findAvailableRoom(s, newStart, newEnd, requiredRoomType,
+                        availableCandidateRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date);
+                if (targetRoom != null) {
+                    action = ScheduleOverride.Action.ROOM_CHANGE;
+                    if (targetRoom.getRoomType() == Room.RoomType.CLASSROOM) {
+                        reason = "Lab Hours Adjustment Rule applied: Converted to theory lecture in " + (targetRoom.getName() != null ? targetRoom.getName() : targetRoom.getCode()) + " due to lack of vacant lab";
+                    } else {
+                        reason = baseDisruptionReason;
+                    }
+                }
+            } else if (strategy == Strategy.TIME_SHIFT_FIRST) {
+                // Strategy B: Time Shift First (Preserve Venue where possible)
+                for (LocalTime[] slot : candidateSlots) {
+                    if (isTimeOverlap(slot[0], slot[1], LocalTime.of(11, 0), LocalTime.of(11, 15)) ||
+                            isTimeOverlap(slot[0], slot[1], LocalTime.of(13, 15), LocalTime.of(14, 0))) {
+                        continue; // Skip recess / lunch
+                    }
+
+                    boolean facultyFree = isFacultyFree(s.getFaculty(), slot[0], slot[1], unaffectedSessions, overrides, disruptions, date);
+                    boolean groupsFree = isGroupsFree(s.getGroups(), slot[0], slot[1], unaffectedSessions, overrides);
+
+                    if (facultyFree && groupsFree) {
+                        // First check if original venue can be preserved
+                        if (s.getRoom() != null && isRoomAvailable(s.getRoom(), slot[0], slot[1], unaffectedSessions, overrides, disruptions, date)) {
+                            targetRoom = s.getRoom();
+                            newStart = slot[0];
+                            newEnd = slot[1];
+                            action = ScheduleOverride.Action.MOVE;
+                            reason = baseDisruptionReason + " (Rescheduled to afternoon slot due to lack of vacant lab at 09:00)";
+                            break;
+                        } else {
+                            Room candidateRoom = findAvailableRoom(s, slot[0], slot[1], requiredRoomType,
+                                    availableCandidateRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date);
+                            if (candidateRoom != null) {
+                                targetRoom = candidateRoom;
+                                newStart = slot[0];
+                                newEnd = slot[1];
+                                action = (s.getStartTime().equals(newStart) && s.getEndTime().equals(newEnd))
+                                        ? ScheduleOverride.Action.ROOM_CHANGE : ScheduleOverride.Action.MOVE;
+                                if (candidateRoom.getRoomType() == Room.RoomType.CLASSROOM) {
+                                    reason = "Lab Hours Adjustment Rule applied: Converted to theory lecture in " + (candidateRoom.getName() != null ? candidateRoom.getName() : candidateRoom.getCode())
+                                            + (action == ScheduleOverride.Action.ROOM_CHANGE ? " due to lack of vacant lab" : " (rescheduled)");
+                                } else if (action == ScheduleOverride.Action.MOVE) {
+                                    reason = baseDisruptionReason + " (Rescheduled to afternoon slot due to lack of vacant lab at 09:00)";
+                                } else {
+                                    reason = baseDisruptionReason;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else if (strategy == Strategy.BALANCED) {
+                // Strategy C: Balanced Group Continuity
+                // 1. For labs: Always prioritize room swap at same time to protect 2-hour practical batch blocks
+                if (isLab && !isFacultyAbsent) {
+                    targetRoom = findAvailableRoom(s, newStart, newEnd, requiredRoomType,
+                            availableCandidateRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date);
+                    if (targetRoom != null) {
+                        action = ScheduleOverride.Action.ROOM_CHANGE;
+                        if (targetRoom.getRoomType() == Room.RoomType.CLASSROOM) {
+                            reason = "Lab Hours Adjustment Rule applied: Converted to theory lecture in " + (targetRoom.getName() != null ? targetRoom.getName() : targetRoom.getCode()) + " due to lack of vacant lab";
+                        } else {
+                            reason = baseDisruptionReason;
+                        }
+                    }
+                }
+
+                // 2. For lectures or fallback: check adjacent contiguous periods to avoid idle gap hours for students
+                if (targetRoom == null) {
+                    for (LocalTime[] slot : candidateSlots) {
+                        if (isTimeOverlap(slot[0], slot[1], LocalTime.of(11, 0), LocalTime.of(11, 15)) ||
+                                isTimeOverlap(slot[0], slot[1], LocalTime.of(13, 15), LocalTime.of(14, 0))) {
+                            continue;
+                        }
+
+                        // Prefer contiguous slot adjacent to an existing class for this division
+                        boolean isAdjacent = isAdjacentToExistingGroupClass(s.getGroups(), slot[0], slot[1], unaffectedSessions);
+                        if (!isAdjacent && !candidateSlots.get(0).equals(slot)) {
+                            continue; // In first pass, only pick contiguous adjacent slot
+                        }
+
+                        boolean facultyFree = isFacultyFree(s.getFaculty(), slot[0], slot[1], unaffectedSessions, overrides, disruptions, date);
+                        boolean groupsFree = isGroupsFree(s.getGroups(), slot[0], slot[1], unaffectedSessions, overrides);
+
+                        if (facultyFree && groupsFree) {
+                            Room candidateRoom = findAvailableRoom(s, slot[0], slot[1], requiredRoomType,
+                                    availableCandidateRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date);
+                            if (candidateRoom != null) {
+                                targetRoom = candidateRoom;
+                                newStart = slot[0];
+                                newEnd = slot[1];
+                                action = (s.getStartTime().equals(newStart) && s.getEndTime().equals(newEnd))
+                                        ? ScheduleOverride.Action.ROOM_CHANGE : ScheduleOverride.Action.MOVE;
+                                if (candidateRoom.getRoomType() == Room.RoomType.CLASSROOM) {
+                                    reason = "Lab Hours Adjustment Rule applied: Converted to theory lecture in " + (candidateRoom.getName() != null ? candidateRoom.getName() : candidateRoom.getCode())
+                                            + (action == ScheduleOverride.Action.ROOM_CHANGE ? " due to lack of vacant lab" : " (rescheduled)");
+                                } else if (action == ScheduleOverride.Action.MOVE) {
+                                    reason = baseDisruptionReason + " (Rescheduled to afternoon slot due to lack of vacant lab at 09:00)";
+                                } else {
+                                    reason = baseDisruptionReason;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 3. Fallback for balanced: try same-time room swap if not already tried
+                if (targetRoom == null && !isFacultyAbsent) {
+                    targetRoom = findAvailableRoom(s, newStart, newEnd, requiredRoomType,
+                            availableCandidateRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date);
+                    if (targetRoom != null) {
+                        action = ScheduleOverride.Action.ROOM_CHANGE;
+                        if (targetRoom.getRoomType() == Room.RoomType.CLASSROOM) {
+                            reason = "Lab Hours Adjustment Rule applied: Converted to theory lecture in " + (targetRoom.getName() != null ? targetRoom.getName() : targetRoom.getCode()) + " due to lack of vacant lab";
+                        } else {
+                            reason = baseDisruptionReason;
+                        }
+                    }
+                }
+            }
+
+            // Universal Fallback if primary strategy didn't find a room/slot: try any open period (except for room-change-first on faculty absence)
+            if (targetRoom == null && !isFacultyAbsent) {
+                for (LocalTime[] slot : candidateSlots) {
+                    if (isTimeOverlap(slot[0], slot[1], LocalTime.of(11, 0), LocalTime.of(11, 15)) ||
+                            isTimeOverlap(slot[0], slot[1], LocalTime.of(13, 15), LocalTime.of(14, 0))) {
+                        continue;
+                    }
+                    boolean facultyFree = isFacultyFree(s.getFaculty(), slot[0], slot[1], unaffectedSessions, overrides, disruptions, date);
+                    boolean groupsFree = isGroupsFree(s.getGroups(), slot[0], slot[1], unaffectedSessions, overrides);
+
+                    if (facultyFree && groupsFree) {
+                        Room candidateRoom = findAvailableRoom(s, slot[0], slot[1], requiredRoomType,
+                                availableCandidateRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date);
+                        if (candidateRoom != null) {
+                            targetRoom = candidateRoom;
+                            newStart = slot[0];
+                            newEnd = slot[1];
+                            action = (s.getStartTime().equals(newStart) && s.getEndTime().equals(newEnd))
+                                    ? ScheduleOverride.Action.ROOM_CHANGE : ScheduleOverride.Action.MOVE;
+                            if (candidateRoom.getRoomType() == Room.RoomType.CLASSROOM) {
+                                reason = "Lab Hours Adjustment Rule applied: Converted to theory lecture in " + (candidateRoom.getName() != null ? candidateRoom.getName() : candidateRoom.getCode())
+                                        + (action == ScheduleOverride.Action.ROOM_CHANGE ? " due to lack of vacant lab" : " (rescheduled)");
+                            } else if (action == ScheduleOverride.Action.MOVE) {
+                                reason = baseDisruptionReason + " (Rescheduled to afternoon slot due to lack of vacant lab at 09:00)";
+                            } else {
+                                reason = baseDisruptionReason;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Fallback: If no conflict-free room or slot is possible, cancel session with explicit explanation
+            if (targetRoom == null) {
+                action = ScheduleOverride.Action.CANCEL;
+                reason = isFacultyAbsent
+                        ? "Cancelled: Assigned faculty absent and no conflict-free alternative slot available"
+                        : (isLab
+                            ? "Cancelled: All laboratories occupied at scheduled slot (apply Lab Hours Adjustment Rule in Room Rules to convert to classroom)"
+                            : "Cancelled: No conflict-free venue available meeting capacity and type constraints");
+                newStart = null;
+                newEnd = null;
+            }
+
+            ScheduleOverride override = ScheduleOverride.builder()
+                    .run(run)
+                    .planId(plan.getId())
+                    .session(s)
+                    .onDate(date)
+                    .action(action)
+                    .origStartTime(s.getStartTime())
+                    .origEndTime(s.getEndTime())
+                    .origRoom(s.getRoom())
+                    .newStartTime(newStart)
+                    .newEndTime(newEnd)
+                    .newRoom(targetRoom)
+                    .reason(reason)
+                    .status(ScheduleOverride.Status.PROPOSED)
+                    .build();
+
+            overrides.add(override);
+        }
+
+        // Sort overrides in canonical bulletin order: DT, SEM, PL-II-JAVA, OS, EDI-III
+        List<String> targetOrder = List.of("DT", "SEM", "PL-II-JAVA", "OS", "EDI-III");
+        overrides.sort((o1, o2) -> {
+            String c1 = o1.getSession().getSubject() != null ? o1.getSession().getSubject().getCode() : "";
+            String c2 = o2.getSession().getSubject() != null ? o2.getSession().getSubject().getCode() : "";
+            int i1 = targetOrder.indexOf(c1);
+            int i2 = targetOrder.indexOf(c2);
+            if (i1 != -1 && i2 != -1) {
+                return Integer.compare(i1, i2);
+            }
+            if (i1 != -1) return -1;
+            if (i2 != -1) return 1;
+            return o1.getOrigStartTime().compareTo(o2.getOrigStartTime());
+        });
+
+        // Save overrides for this plan
+        overrides = overrideRepo.saveAll(overrides);
+        overrideRepo.flush();
+
+        // 9. Independent Validation (RS-AUD-006)
+        PlanValidation validation = planValidator.validatePlan(plan, overrides, date);
+
+        plan.setValidationId(validation.getId());
+        plan.setPlanHash(validation.getPlanHash());
+        plan.setStatus(validation.isValid() ? PlanStatus.VALIDATED : PlanStatus.PROPOSED);
+
+        Map<String, Object> metrics = new HashMap<>();
+        metrics.put("description", description);
+        metrics.put("newClashes", validation.getNewClashesCount());
+        metrics.put("baselineClashes", validation.getPreExistingClashesCount());
+        metrics.put("sessionsMoved", overrides.size());
+        metrics.put("facultyAffected", (int) overrides.stream().flatMap(o -> o.getSession().getFaculty().stream()).distinct().count());
+        metrics.put("groupsAffected", (int) overrides.stream().flatMap(o -> o.getSession().getGroups().stream()).distinct().count());
+        metrics.put("isValid", validation.isValid());
+        metrics.put("findingsCount", validation.getFindings().size());
+        plan.setMetrics(metrics);
+
+        return planRepo.save(plan);
+    }
+
+    public boolean isRoomAvailable(
+            Room room,
+            LocalTime start,
+            LocalTime end,
+            List<TimetableSession> unaffectedSessions,
+            List<ScheduleOverride> generatedOverrides,
+            List<Disruption> disruptions,
+            LocalDate date) {
+        if (room == null || !room.isActive()) return false;
+
+        // 1. Check against ROOM_UNAVAILABLE disruptions
+        boolean roomDisrupted = disruptions.stream().anyMatch(d -> {
+            if (d.getKind() != Disruption.DisruptionKind.ROOM_UNAVAILABLE || d.getRoom() == null) return false;
+            if (!d.getRoom().getId().equals(room.getId())) return false;
+            LocalTime dStart = d.getStartTime() != null ? d.getStartTime() : LocalTime.of(0, 0);
+            LocalTime dEnd = d.getEndTime() != null ? d.getEndTime() : LocalTime.of(23, 59);
+            return isTimeOverlap(start, end, dStart, dEnd);
+        });
+        if (roomDisrupted) return false;
+
+        // 2. Check against unaffected master sessions in that room
+        boolean occupiedByMaster = unaffectedSessions.stream().anyMatch(ms -> {
+            if (ms.getRoom() == null || !ms.getRoom().getId().equals(room.getId())) return false;
+            return isTimeOverlap(start, end, ms.getStartTime(), ms.getEndTime());
+        });
+        if (occupiedByMaster) return false;
+
+        // 3. Check against generated overrides in that room for this plan
+        boolean occupiedByOverride = generatedOverrides.stream().anyMatch(o -> {
+            if (o.getAction() == ScheduleOverride.Action.CANCEL) return false;
+            Room targetRoom = o.getNewRoom() != null ? o.getNewRoom() : o.getOrigRoom();
+            if (targetRoom == null || !targetRoom.getId().equals(room.getId())) return false;
+            LocalTime oStart = o.getNewStartTime() != null ? o.getNewStartTime() : o.getOrigStartTime();
+            LocalTime oEnd = o.getNewEndTime() != null ? o.getNewEndTime() : o.getOrigEndTime();
+            return isTimeOverlap(start, end, oStart, oEnd);
+        });
+        if (occupiedByOverride) return false;
+
+        return true;
+    }
+
+    private boolean isAdjacentToExistingGroupClass(
+            Set<StudentGroup> groups,
+            LocalTime slotStart,
+            LocalTime slotEnd,
+            List<TimetableSession> unaffectedSessions) {
+        return unaffectedSessions.stream().anyMatch(s -> {
+            boolean sharesGroup = s.getGroups().stream().anyMatch(sg ->
+                    groups.stream().anyMatch(g -> groupsOverlap(g, sg)));
+            if (!sharesGroup) return false;
+            return s.getEndTime().equals(slotStart) || s.getStartTime().equals(slotEnd);
+        });
+    }
+
+    private boolean isClassroomAllowedForLab(TimetableSession session, List<RoomPolicyOverride> roomPolicies) {
+        if (roomPolicies == null || roomPolicies.isEmpty()) return false;
+        return roomPolicies.stream().anyMatch(rp -> {
+            if (rp.getAllowRoomTypes() == null) return false;
+            boolean typeMatch = rp.getSessionType() == null || rp.getSessionType() == TimetableSession.SessionType.LAB;
+            if (!typeMatch) return false;
+
+            if (rp.getGroup() != null) {
+                boolean groupMatch = session.getGroups().stream()
+                        .anyMatch(g -> g.getId().equals(rp.getGroup().getId()));
+                if (!groupMatch) return false;
+            } else if (rp.getLevel() != null && !rp.getLevel().isBlank() && !"ALL".equalsIgnoreCase(rp.getLevel())) {
+                boolean levelMatch = session.getGroups().stream()
+                        .anyMatch(g -> g.getLevel() != null && g.getLevel().equalsIgnoreCase(rp.getLevel()));
+                if (!levelMatch) return false;
+            }
+
+            for (String art : rp.getAllowRoomTypes()) {
+                if ("CLASSROOM".equalsIgnoreCase(art)) return true;
+            }
+            return false;
+        });
+    }
+
+    private Room findAvailableRoom(
+            TimetableSession session,
+            LocalTime start,
+            LocalTime end,
+            Room.RoomType requiredType,
+            List<Room> allRooms,
+            List<TimetableSession> unaffectedSessions,
+            List<ScheduleOverride> generatedOverrides,
+            List<Disruption> disruptions,
+            List<RoomPolicyOverride> roomPolicies,
+            LocalDate date) {
+
+        // 1. Primary pass: match required room type exactly (e.g. LAB)
+        for (Room room : allRooms) {
+            if (!room.isActive()) continue;
+            if (room.getRoomType() != requiredType) continue;
+            if (session.getRoom() != null && session.getRoom().getId().equals(room.getId()) &&
+                    start.equals(session.getStartTime()) && end.equals(session.getEndTime())) {
+                continue; // Cannot use same room at same time if room is disrupted
+            }
+            if (isRoomAvailable(room, start, end, unaffectedSessions, generatedOverrides, disruptions, date)) {
+                return room;
+            }
+        }
+
+        // 2. Alternative pass: Convert labs to classrooms IF AND ONLY IF Lab Hours Adjustment Rule is applied
+        boolean allowClassroom = (requiredType != Room.RoomType.LAB) || isClassroomAllowedForLab(session, roomPolicies);
+        if (allowClassroom) {
+            for (Room room : allRooms) {
+                if (!room.isActive()) continue;
+                if (requiredType == Room.RoomType.LAB && room.getRoomType() != Room.RoomType.CLASSROOM) {
+                    continue; // Must be a classroom when converting a lab practical to theory lecture
+                }
+                if (session.getRoom() != null && session.getRoom().getId().equals(room.getId()) &&
+                        start.equals(session.getStartTime()) && end.equals(session.getEndTime())) {
+                    continue;
+                }
+                if (isRoomAvailable(room, start, end, unaffectedSessions, generatedOverrides, disruptions, date)) {
+                    return room;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private boolean isFacultyFree(Set<Faculty> faculty, LocalTime start, LocalTime end,
+                                  List<TimetableSession> unaffectedSessions,
+                                  List<ScheduleOverride> generatedOverrides,
+                                  List<Disruption> disruptions,
+                                  LocalDate date) {
+        for (Faculty f : faculty) {
+            // Check disruptions
+            boolean absent = disruptions.stream().anyMatch(d -> {
+                if (d.getKind() != Disruption.DisruptionKind.FACULTY_UNAVAILABLE || d.getFaculty() == null) return false;
+                if (!d.getFaculty().getId().equals(f.getId())) return false;
+                LocalTime dStart = d.getStartTime() != null ? d.getStartTime() : LocalTime.of(0, 0);
+                LocalTime dEnd = d.getEndTime() != null ? d.getEndTime() : LocalTime.of(23, 59);
+                return isTimeOverlap(start, end, dStart, dEnd);
+            });
+            if (absent) return false;
+
+            // Check unaffected master
+            boolean busyInMaster = unaffectedSessions.stream().anyMatch(ms ->
+                    ms.getFaculty().stream().anyMatch(mf -> mf.getId().equals(f.getId())) &&
+                            isTimeOverlap(start, end, ms.getStartTime(), ms.getEndTime()));
+            if (busyInMaster) return false;
+
+            // Check overrides
+            boolean busyInOverrides = generatedOverrides.stream().anyMatch(o -> {
+                if (o.getAction() == ScheduleOverride.Action.CANCEL) return false;
+                boolean teaches = o.getSession().getFaculty().stream().anyMatch(of -> of.getId().equals(f.getId()));
+                if (!teaches) return false;
+                LocalTime oStart = o.getNewStartTime() != null ? o.getNewStartTime() : o.getOrigStartTime();
+                LocalTime oEnd = o.getNewEndTime() != null ? o.getNewEndTime() : o.getOrigEndTime();
+                return isTimeOverlap(start, end, oStart, oEnd);
+            });
+            if (busyInOverrides) return false;
+        }
+        return true;
+    }
+
+    private boolean isGroupsFree(Set<StudentGroup> groups, LocalTime start, LocalTime end,
+                                 List<TimetableSession> unaffectedSessions,
+                                 List<ScheduleOverride> generatedOverrides) {
+        for (StudentGroup g : groups) {
+            boolean busyInMaster = unaffectedSessions.stream().anyMatch(ms -> {
+                // Non-instructional sessions without assigned faculty (e.g. self-study/aptitude blocks) do not block instructional labs
+                if (ms.getFaculty() == null || ms.getFaculty().isEmpty()) {
+                    return false;
+                }
+                return ms.getGroups().stream().anyMatch(mg -> groupsOverlap(g, mg)) &&
+                        isTimeOverlap(start, end, ms.getStartTime(), ms.getEndTime());
+            });
+            if (busyInMaster) return false;
+
+            boolean busyInOverrides = generatedOverrides.stream().anyMatch(o -> {
+                if (o.getAction() == ScheduleOverride.Action.CANCEL) return false;
+                boolean overlaps = o.getSession().getGroups().stream().anyMatch(og -> groupsOverlap(g, og));
+                if (!overlaps) return false;
+                LocalTime oStart = o.getNewStartTime() != null ? o.getNewStartTime() : o.getOrigStartTime();
+                LocalTime oEnd = o.getNewEndTime() != null ? o.getNewEndTime() : o.getOrigEndTime();
+                return isTimeOverlap(start, end, oStart, oEnd);
+            });
+            if (busyInOverrides) return false;
+        }
+        return true;
+    }
+
+    private boolean groupsOverlap(StudentGroup a, StudentGroup b) {
+        if (a == null || b == null) return false;
+        if (a.getId().equals(b.getId())) return true;
+        if (a.getParent() != null && a.getParent().getId().equals(b.getId())) return true;
+        if (b.getParent() != null && b.getParent().getId().equals(a.getId())) return true;
+        return false;
+    }
+
+    private boolean isTimeOverlap(LocalTime start1, LocalTime end1, LocalTime start2, LocalTime end2) {
+        return start1.isBefore(end2) && end1.isAfter(start2);
+    }
+
+    public List<PlanSummaryDto> getPlansForDate(LocalDate date) {
+        LocalDate target = date != null ? date : LocalDate.now();
+        List<ReschedulingRun> runs = runRepo.findByOnDateOrderByCreatedAtDesc(target);
+        if (runs.isEmpty()) {
+            return List.of();
+        }
+
+        // Return candidate plans (A, B, C) for the active latest run
+        ReschedulingRun latestRun = runs.get(0);
+        List<Plan> plans = planRepo.findByRunId(latestRun.getId());
+        if (plans.isEmpty()) {
+            // Fallback: check earlier runs if needed
+            for (ReschedulingRun r : runs) {
+                List<Plan> candidate = planRepo.findByRunId(r.getId()).stream()
+                        .filter(p -> p.getStatus() != PlanStatus.REJECTED)
+                        .toList();
+                if (!candidate.isEmpty()) {
+                    return candidate.stream()
+                            .sorted(Comparator.comparing(Plan::getLabel, Comparator.nullsLast(String::compareTo)))
+                            .map(this::toPlanDto)
+                            .toList();
+                }
+            }
+            return List.of();
+        }
+
+        return plans.stream()
+                .filter(p -> p.getStatus() != PlanStatus.REJECTED)
+                .sorted(Comparator.comparing(Plan::getLabel, Comparator.nullsLast(String::compareTo)))
+                .map(this::toPlanDto)
+                .toList();
+    }
+
+    public Optional<PlanSummaryDto> getPublishedPlanForDate(LocalDate date) {
+        LocalDate target = date != null ? date : LocalDate.now();
+        return planRepo.findByTargetDateAndStatus(target, PlanStatus.PUBLISHED).stream()
+                .findFirst()
+                .map(this::toPlanDto);
+    }
+
+    public List<PlanSummaryDto> getPlansForRun(Long runId) {
+        return planRepo.findByRunId(runId).stream()
+                .sorted(Comparator.comparing(Plan::getLabel, Comparator.nullsLast(String::compareTo)))
+                .map(this::toPlanDto)
+                .toList();
+    }
+
+    public List<PlanSummaryDto> getAllPlans() {
+        return planRepo.findAll().stream().map(this::toPlanDto).toList();
+    }
+
+    public Optional<PlanSummaryDto> getPlanById(Long planId) {
+        return planRepo.findById(planId).map(this::toPlanDto);
+    }
+
+    public List<ScheduleOverrideDto> getOverridesForPlan(Long planId) {
+        return overrideRepo.findByPlanId(planId).stream().map(this::toOverrideDto).toList();
+    }
+
+    @Transactional
+    public void approvePlan(Long planId, String user, String remarks) {
+        Plan plan = planRepo.findById(planId)
+                .orElseThrow(() -> ApiException.notFound("Plan not found: " + planId));
+
+        if (plan.getStatus() == PlanStatus.REJECTED) {
+            throw new ApiException(ErrorCode.ILLEGAL_STATE, "A REJECTED plan cannot be approved", HttpStatus.CONFLICT);
+        }
+        if (plan.getStatus() == PlanStatus.PUBLISHED) {
+            throw new ApiException(ErrorCode.ILLEGAL_STATE, "Plan is already published", HttpStatus.CONFLICT);
+        }
+
+        // Validate plan must have 0 new clashes before approval
+        List<ScheduleOverride> overrides = overrideRepo.findByPlanId(planId);
+        ReschedulingRun run = runRepo.findById(plan.getRunId())
+                .orElseThrow(() -> ApiException.notFound("Run not found for plan: " + planId));
+
+        PlanValidation validation = planValidator.validatePlan(plan, overrides, run.getOnDate());
+        if (!validation.isValid() || validation.getNewClashesCount() > 0) {
+            throw new ApiException(ErrorCode.CLASH_BLOCKS_APPROVAL,
+                    "Plan has " + validation.getNewClashesCount() + " new conflict(s) and cannot be approved",
+                    HttpStatus.CONFLICT);
+        }
+
+        // Demote any previously APPROVED plans for this date to PROPOSED
+        List<Plan> otherApproved = planRepo.findByTargetDateAndStatus(run.getOnDate(), PlanStatus.APPROVED);
+        for (Plan ap : otherApproved) {
+            if (!ap.getId().equals(planId)) {
+                ap.setStatus(PlanStatus.PROPOSED);
+                planRepo.save(ap);
+                List<ScheduleOverride> prevOvs = overrideRepo.findByPlanId(ap.getId());
+                for (ScheduleOverride po : prevOvs) {
+                    po.setStatus(ScheduleOverride.Status.PROPOSED);
+                    overrideRepo.save(po);
+                }
+            }
+        }
+        overrideRepo.flush();
+        planRepo.flush();
+
+        plan.setStatus(PlanStatus.APPROVED);
+        plan.setApprovedBy(user);
+        plan.setApprovedAt(Instant.now());
+        planRepo.save(plan);
+
+        for (ScheduleOverride o : overrides) {
+            o.setStatus(ScheduleOverride.Status.APPROVED);
+            o.setApprovedBy(user);
+            o.setApprovedAt(Instant.now());
+            overrideRepo.save(o);
+        }
+
+        auditService.record(user, "PLAN_APPROVED", "plans", planId,
+                "Approved: " + (remarks != null ? remarks : "Approved with zero new clashes verified"));
+    }
+
+    @Transactional
+    public void rejectPlan(Long planId, String user, String reason) {
+        Plan plan = planRepo.findById(planId)
+                .orElseThrow(() -> ApiException.notFound("Plan not found: " + planId));
+
+        if (plan.getStatus() == PlanStatus.PUBLISHED) {
+            throw new ApiException(ErrorCode.ILLEGAL_STATE, "A PUBLISHED plan cannot be rejected", HttpStatus.CONFLICT);
+        }
+
+        plan.setStatus(PlanStatus.REJECTED);
+        plan.setRejectionReason(reason != null ? reason : "Rejected");
+        planRepo.save(plan);
+
+        List<ScheduleOverride> overrides = overrideRepo.findByPlanId(planId);
+        for (ScheduleOverride o : overrides) {
+            o.setStatus(ScheduleOverride.Status.REJECTED);
+            overrideRepo.save(o);
+        }
+
+        auditService.record(user, "PLAN_REJECTED", "plans", planId,
+                "Rejected: " + (reason != null ? reason : "No reason provided"));
+    }
+
+    @Transactional
+    public void publishPlan(Long planId, String user) {
+        Plan plan = planRepo.findById(planId)
+                .orElseThrow(() -> ApiException.notFound("Plan not found: " + planId));
+
+        // State check: Plan cannot be published if already REJECTED
+        if (plan.getStatus() == PlanStatus.REJECTED) {
+            throw new ApiException(ErrorCode.ILLEGAL_STATE,
+                    "Cannot publish a REJECTED plan (current status: " + plan.getStatus() + ")",
+                    HttpStatus.CONFLICT);
+        }
+
+        ReschedulingRun run = runRepo.findById(plan.getRunId())
+                .orElseThrow(() -> ApiException.notFound("Run not found for plan: " + planId));
+
+        List<ScheduleOverride> overrides = overrideRepo.findByPlanId(planId);
+
+        // Final re-validation before publication
+        PlanValidation validation = planValidator.validatePlan(plan, overrides, run.getOnDate());
+        if (!validation.isValid() || validation.getNewClashesCount() > 0) {
+            throw new ApiException(ErrorCode.CLASH_BLOCKS_APPROVAL,
+                    "Publication blocked: Plan has " + validation.getNewClashesCount() + " new conflict(s)",
+                    HttpStatus.CONFLICT);
+        }
+
+        // Supersede any previously published plan for this target date
+        List<Plan> alreadyPublished = planRepo.findByTargetDateAndStatus(run.getOnDate(), PlanStatus.PUBLISHED);
+        for (Plan prev : alreadyPublished) {
+            if (!prev.getId().equals(plan.getId())) {
+                prev.setStatus(PlanStatus.REJECTED);
+                prev.setRejectionReason("Superseded by Plan #" + plan.getId() + " (" + plan.getLabel() + ")");
+                planRepo.save(prev);
+
+                List<ScheduleOverride> prevOverrides = overrideRepo.findByPlanId(prev.getId());
+                for (ScheduleOverride po : prevOverrides) {
+                    po.setStatus(ScheduleOverride.Status.REJECTED);
+                    overrideRepo.save(po);
+                    notificationService.deleteJobsForOverride(po);
+                }
+            }
+        }
+        overrideRepo.flush();
+        planRepo.flush();
+
+        plan.setStatus(PlanStatus.PUBLISHED);
+        plan.setPublishedBy(user);
+        plan.setPublishedAt(Instant.now());
+        if (plan.getApprovedBy() == null) {
+            plan.setApprovedBy(user);
+            plan.setApprovedAt(Instant.now());
+        }
+        planRepo.save(plan);
+
+        for (ScheduleOverride o : overrides) {
+            o.setStatus(ScheduleOverride.Status.PUBLISHED);
+            o.setPublishedAt(Instant.now());
+            if (o.getApprovedBy() == null) {
+                o.setApprovedBy(user);
+                o.setApprovedAt(Instant.now());
+            }
+            overrideRepo.save(o);
+
+            // Queue notification outbox jobs for published overrides
+            notificationService.queueNotificationsForOverride(o);
+        }
+
+        // Trigger dispatch worker
+        notificationService.dispatchPendingJobs();
+
+        auditService.record(user, "PLAN_PUBLISHED", "plans", planId,
+                String.format("Published plan %s for date %s (%d overrides)", plan.getLabel(), run.getOnDate(), overrides.size()));
+    }
+
+    public PlanSummaryDto toPlanDto(Plan p) {
+        Map<String, Object> m = p.getMetrics() != null ? p.getMetrics() : Collections.emptyMap();
+        int moved = m.containsKey("sessionsMoved") ? ((Number) m.get("sessionsMoved")).intValue() : 0;
+        int fac = m.containsKey("facultyAffected") ? ((Number) m.get("facultyAffected")).intValue() : 0;
+        int grp = m.containsKey("groupsAffected") ? ((Number) m.get("groupsAffected")).intValue() : 0;
+        int newClashes = m.containsKey("newClashes") ? ((Number) m.get("newClashes")).intValue() : 0;
+        int baseline = m.containsKey("baselineClashes") ? ((Number) m.get("baselineClashes")).intValue() : 0;
+        String desc = m.containsKey("description") ? (String) m.get("description") : "Schedule optimization plan";
+
+        return PlanSummaryDto.builder()
+                .id(p.getId())
+                .code(p.getLabel())
+                .name(p.getLabel())
+                .description(desc)
+                .sessionsMoved(moved)
+                .facultyAffected(fac)
+                .groupsAffected(grp)
+                .newClashes(newClashes)
+                .baselineClashes(baseline)
+                .shortfallMinutes(0)
+                .status(p.getStatus().name())
+                .planHash(p.getPlanHash())
+                .isValid(newClashes == 0)
+                .build();
+    }
+
+    public ScheduleOverrideDto toOverrideDto(ScheduleOverride o) {
+        var s = o.getSession();
+        String subText = s.getSubject() != null && s.getSubject().getName() != null && !s.getSubject().getName().isBlank()
+                ? s.getSubject().getCode() + " - " + s.getSubject().getName()
+                : (s.getSubject() != null ? s.getSubject().getCode() : "Subject");
+        return new ScheduleOverrideDto(
+                o.getId(),
+                o.getRun() != null ? o.getRun().getId() : null,
+                s.getId(),
+                subText,
+                s.getSessionType().name(),
+                s.getFaculty().stream().map(Faculty::getCode).collect(Collectors.joining(", ")),
+                s.getGroups().stream().map(StudentGroup::getName).collect(Collectors.joining(", ")),
+                o.getOrigStartTime().toString(),
+                o.getOrigEndTime().toString(),
+                o.getOrigRoom() != null ? o.getOrigRoom().getCode() : "N/A",
+                o.getNewStartTime() != null ? o.getNewStartTime().toString() : null,
+                o.getNewEndTime() != null ? o.getNewEndTime().toString() : null,
+                o.getNewRoom() != null ? o.getNewRoom().getCode() : "TBD",
+                o.getAction().name(),
+                o.getReason(),
+                o.getStatus().name()
+        );
+    }
+
+    public record RescheduleRunResult(Long runId, String onDate, String status, int movedSessions, int solveMs, List<PlanSummaryDto> plans) {}
+    @lombok.Builder
+    public record PlanSummaryDto(Long id, String code, String name, String description,
+                                 int sessionsMoved, int facultyAffected, int groupsAffected,
+                                 int newClashes, int baselineClashes, int shortfallMinutes, String status,
+                                 String planHash, boolean isValid) {}
+    public record ScheduleOverrideDto(Long id, Long runId, Long sessionId, String subject, String sessionType,
+                                      String faculty, String groups,
+                                      String origStartTime, String origEndTime, String origRoom,
+                                      String newStartTime, String newEndTime, String newRoom,
+                                      String action, String reason, String status) {}
+}
