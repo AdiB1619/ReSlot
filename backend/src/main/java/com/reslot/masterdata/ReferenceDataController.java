@@ -55,15 +55,38 @@ public class ReferenceDataController {
     @PreAuthorize("hasAnyRole('COORDINATOR', 'ADMIN')")
     @ResponseStatus(HttpStatus.CREATED)
     public RoomDto createRoom(@Valid @RequestBody CreateRoomRequest req) {
-        Room room = Room.builder()
-                .code(req.code())
-                .name(req.name())
-                .roomType(Room.RoomType.valueOf(req.roomType()))
-                .labCode(req.labCode())
-                .capacity(req.capacity())
-                .isTemporary(req.isTemporary())
-                .isActive(true)
-                .build();
+        String cleanCode = req.code().trim().toUpperCase();
+        java.util.Optional<Room> existing = roomRepo.findByCode(cleanCode);
+        Room room;
+        Room.RoomType type;
+        try {
+            type = Room.RoomType.valueOf(req.roomType().trim().toUpperCase());
+        } catch (Exception e) {
+            type = Room.RoomType.OTHER;
+        }
+        int cap = (req.capacity() != null && req.capacity() > 0) ? req.capacity() : 60;
+
+        if (existing.isPresent()) {
+            room = existing.get();
+            room.setName(req.name());
+            room.setRoomType(type);
+            room.setCapacity(cap);
+            room.setTemporary(req.isTemporary());
+            room.setActive(true);
+            if (req.labCode() != null && !req.labCode().isBlank()) {
+                room.setLabCode(req.labCode());
+            }
+        } else {
+            room = Room.builder()
+                    .code(cleanCode)
+                    .name(req.name())
+                    .roomType(type)
+                    .labCode(req.labCode())
+                    .capacity(cap)
+                    .isTemporary(req.isTemporary())
+                    .isActive(true)
+                    .build();
+        }
         return toDto(roomRepo.save(room));
     }
 

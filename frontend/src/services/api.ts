@@ -153,6 +153,11 @@ export const api = {
     return res.data;
   },
 
+  async createRoom(payload: { code: string; name: string; roomType: string; capacity?: number; isTemporary?: boolean }): Promise<RoomItem> {
+    const res = await apiClient.post('/rooms', payload);
+    return res.data;
+  },
+
   async getFaculty(): Promise<FacultyItem[]> {
     const res = await apiClient.get('/faculty');
     return res.data;
