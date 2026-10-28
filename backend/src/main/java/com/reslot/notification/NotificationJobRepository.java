@@ -15,4 +15,6 @@ public interface NotificationJobRepository extends JpaRepository<NotificationJob
 
     @Query("SELECT n FROM NotificationJob n WHERE n.override.id = :overrideId")
     List<NotificationJob> findByOverrideId(Long overrideId);
+
+    Optional<NotificationJob> findByProviderMessageId(String providerMessageId);
 }

@@ -22,12 +22,15 @@ public class NotificationService {
 
     private final NotificationJobRepository jobRepo;
     private final com.reslot.reschedule.ScheduleOverrideRepository overrideRepo;
+    private final WhatsAppCloudApiClient whatsAppClient;
 
     public NotificationService(
             NotificationJobRepository jobRepo,
-            com.reslot.reschedule.ScheduleOverrideRepository overrideRepo) {
+            com.reslot.reschedule.ScheduleOverrideRepository overrideRepo,
+            WhatsAppCloudApiClient whatsAppClient) {
         this.jobRepo = jobRepo;
         this.overrideRepo = overrideRepo;
+        this.whatsAppClient = whatsAppClient;
     }
 
     public List<BroadcastDraft> getBroadcastDrafts(java.time.LocalDate date) {
@@ -299,13 +302,17 @@ public class NotificationService {
         List<NotificationJob> pending = jobRepo.findByStatus(NotificationJob.Status.PENDING);
         for (NotificationJob job : pending) {
             try {
-                // In demo/test mode, we simulate dispatch & record transparent sandbox provider id
+                String recipientPhone = null;
+                if (job.getFaculty() != null && job.getFaculty().getWhatsappE164() != null) {
+                    recipientPhone = job.getFaculty().getWhatsappE164();
+                }
+                String providerId = whatsAppClient.sendTextMessage(recipientPhone, job.getMessage());
                 job.setStatus(NotificationJob.Status.SENT);
-                job.setProviderMessageId("sandbox_simulated_" + job.getId());
+                job.setProviderMessageId(providerId);
                 job.setSentAt(Instant.now());
                 job.setAttempts(job.getAttempts() + 1);
                 jobRepo.save(job);
-                log.info("Dispatched notification job id={} [SIMULATED SANDBOX]", job.getId());
+                log.info("Dispatched notification job id={} [providerId={}]", job.getId(), providerId);
             } catch (Exception e) {
                 job.setStatus(NotificationJob.Status.FAILED);
                 job.setLastError(e.getMessage());

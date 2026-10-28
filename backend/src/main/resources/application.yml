@@ -56,7 +56,7 @@ app:
     phone-number-id: ${WHATSAPP_PHONE_NUMBER_ID:}
     access-token: ${WHATSAPP_ACCESS_TOKEN:}
     app-secret: ${WHATSAPP_APP_SECRET:}
-    verify-token: ${WHATSAPP_VERIFY_TOKEN:}
+    verify-token: ${WHATSAPP_VERIFY_TOKEN:reslot_verify_token}
     sandbox: ${WHATSAPP_SANDBOX:true}
   llm:
     api-key: ${GEMINI_API_KEY:${LLM_API_KEY:}}
@@ -64,6 +64,10 @@ app:
     monthly-token-budget: ${LLM_MONTHLY_TOKEN_BUDGET:100000}
   pii:
     encryption-key: ${PII_ENCRYPTION_KEY:dev-enc-key-32-chars-change-me!!}
+
+reslot:
+  solver:
+    engine: ${RESLOT_SOLVER_ENGINE:heuristic}
 
 logging:
   level:

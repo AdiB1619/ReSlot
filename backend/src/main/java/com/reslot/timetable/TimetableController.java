@@ -13,6 +13,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
 import java.time.DayOfWeek;
 import java.time.LocalDate;
@@ -128,7 +129,7 @@ public class TimetableController {
 
     @GetMapping("/export/excel")
     @Operation(summary = "Export effective timetable to Excel XLSX")
-    public ResponseEntity<byte[]> exportExcel(
+    public ResponseEntity<StreamingResponseBody> exportExcel(
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             @RequestParam(required = false) Long groupId,
             @RequestParam(required = false) Long facultyId,
@@ -136,17 +137,24 @@ public class TimetableController {
 
         LocalDate targetDate = date != null ? date : LocalDate.now();
         List<EffectiveSessionDto> sessions = computeEffectiveSessions(targetDate, groupId, facultyId, roomId);
-        byte[] bytes = exportService.exportToExcel("RSCOE Computer Engineering Timetable", targetDate, sessions);
+
+        StreamingResponseBody stream = out -> {
+            try {
+                exportService.streamToExcel("RSCOE Computer Engineering Timetable", targetDate, sessions, out);
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to stream Excel export", e);
+            }
+        };
 
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"timetable-" + targetDate + ".xlsx\"")
                 .contentType(MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
-                .body(bytes);
+                .body(stream);
     }
 
     @GetMapping("/export/pdf")
     @Operation(summary = "Export effective timetable to PDF")
-    public ResponseEntity<byte[]> exportPdf(
+    public ResponseEntity<StreamingResponseBody> exportPdf(
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             @RequestParam(required = false) Long groupId,
             @RequestParam(required = false) Long facultyId,
@@ -154,12 +162,19 @@ public class TimetableController {
 
         LocalDate targetDate = date != null ? date : LocalDate.now();
         List<EffectiveSessionDto> sessions = computeEffectiveSessions(targetDate, groupId, facultyId, roomId);
-        byte[] bytes = exportService.exportToPdf("RSCOE Effective Schedule", targetDate, sessions);
+
+        StreamingResponseBody stream = out -> {
+            try {
+                exportService.streamToPdf("RSCOE Effective Schedule", targetDate, sessions, out);
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to stream PDF export", e);
+            }
+        };
 
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"timetable-" + targetDate + ".pdf\"")
                 .contentType(MediaType.APPLICATION_PDF)
-                .body(bytes);
+                .body(stream);
     }
 
     @GetMapping("/export/ics")

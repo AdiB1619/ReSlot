@@ -23,8 +23,8 @@ import java.util.stream.Collectors;
 @Service
 public class TimetableExportService {
 
-    public byte[] exportToExcel(String title, LocalDate date, List<TimetableController.EffectiveSessionDto> sessions) {
-        try (XSSFWorkbook workbook = new XSSFWorkbook(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+    public void streamToExcel(String title, LocalDate date, List<TimetableController.EffectiveSessionDto> sessions, java.io.OutputStream out) throws IOException {
+        try (XSSFWorkbook workbook = new XSSFWorkbook()) {
             Sheet sheet = workbook.createSheet("Effective Timetable");
 
             // Header Style
@@ -85,6 +85,12 @@ public class TimetableExportService {
             }
 
             workbook.write(out);
+        }
+    }
+
+    public byte[] exportToExcel(String title, LocalDate date, List<TimetableController.EffectiveSessionDto> sessions) {
+        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            streamToExcel(title, date, sessions, out);
             return out.toByteArray();
         } catch (IOException e) {
             throw new RuntimeException("Failed to generate Excel export", e);
@@ -97,8 +103,8 @@ public class TimetableExportService {
         c.setCellStyle(style);
     }
 
-    public byte[] exportToPdf(String title, LocalDate date, List<TimetableController.EffectiveSessionDto> sessions) {
-        try (PDDocument doc = new PDDocument(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+    public void streamToPdf(String title, LocalDate date, List<TimetableController.EffectiveSessionDto> sessions, java.io.OutputStream out) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
             PDPage page = new PDPage(PDRectangle.A4);
             doc.addPage(page);
 
@@ -170,6 +176,12 @@ public class TimetableExportService {
             }
 
             doc.save(out);
+        }
+    }
+
+    public byte[] exportToPdf(String title, LocalDate date, List<TimetableController.EffectiveSessionDto> sessions) {
+        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            streamToPdf(title, date, sessions, out);
             return out.toByteArray();
         } catch (IOException e) {
             throw new RuntimeException("Failed to generate PDF export", e);

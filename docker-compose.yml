@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: reslot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: reslot
+      POSTGRES_USER: reslot
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-reslot}
+    ports:
+      - "5432:5432"
+    volumes:
+      - reslot-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reslot -d reslot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: reslot-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/reslot?stringtype=unspecified
+      DB_USER: reslot
+      DB_PASSWORD: ${DB_PASSWORD:-reslot}
+      JWT_SIGNING_KEY: ${JWT_SIGNING_KEY:-dev-secret-change-in-production-must-be-256-bits}
+      WHATSAPP_SANDBOX: ${WHATSAPP_SANDBOX:-true}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:-}
+      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-reslot_verify_token}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    ports:
+      - "8080:8080"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: reslot-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+
+volumes:
+  reslot-db-data:

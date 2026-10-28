@@ -41,6 +41,7 @@ public class RescheduleService {
     private final RoomPolicyOverrideRepository roomPolicyRepo;
     private final NotificationService notificationService;
     private final AuditService auditService;
+    private final com.reslot.reschedule.solver.SolverEngineRegistry solverEngineRegistry;
 
     // Standard Lab Blocks (RSCOE grid - strictly 2-hour blocks)
     private static final List<LocalTime[]> LAB_BLOCKS = List.of(
@@ -73,6 +74,29 @@ public class RescheduleService {
             RoomPolicyOverrideRepository roomPolicyRepo,
             NotificationService notificationService,
             AuditService auditService) {
+        this(versionRepo, sessionRepo, disruptionRepo, roomRepo, runRepo,
+                overrideRepo, planRepo, planValidator, roomPolicyRepo,
+                notificationService, auditService,
+                new com.reslot.reschedule.solver.SolverEngineRegistry(List.of(
+                        new com.reslot.reschedule.solver.BacktrackingHeuristicSolverEngine(),
+                        new com.reslot.reschedule.solver.OrToolsCpSatSolverEngine()
+                )));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public RescheduleService(
+            TimetableVersionRepository versionRepo,
+            TimetableSessionRepository sessionRepo,
+            DisruptionRepository disruptionRepo,
+            RoomRepository roomRepo,
+            ReschedulingRunRepository runRepo,
+            ScheduleOverrideRepository overrideRepo,
+            PlanRepository planRepo,
+            PlanValidator planValidator,
+            RoomPolicyOverrideRepository roomPolicyRepo,
+            NotificationService notificationService,
+            AuditService auditService,
+            com.reslot.reschedule.solver.SolverEngineRegistry solverEngineRegistry) {
         this.versionRepo = versionRepo;
         this.sessionRepo = sessionRepo;
         this.disruptionRepo = disruptionRepo;
@@ -84,6 +108,7 @@ public class RescheduleService {
         this.roomPolicyRepo = roomPolicyRepo;
         this.notificationService = notificationService;
         this.auditService = auditService;
+        this.solverEngineRegistry = solverEngineRegistry;
     }
 
     @Transactional
@@ -95,6 +120,8 @@ public class RescheduleService {
             throw new ApiException(ErrorCode.VALIDATION_FAILED,
                     "Timetable rescheduling is not allowed on Sunday (" + date + ")", HttpStatus.BAD_REQUEST);
         }
+
+        log.info("Triggering rescheduling run for date {} using active solver engine: {}", date, solverEngineRegistry.getActiveEngine().getEngineName());
 
         // 2. Load active master timetable version
         TimetableVersion version = versionRepo.findActive()
@@ -332,8 +359,9 @@ public class RescheduleService {
 
             if (!isFacultyAbsent && strategy == Strategy.ROOM_CHANGE_FIRST) {
                 // Strategy A: Room Swap First (Same Time)
+                // Preserves original class times and shifts affected sessions to vacant rooms of identical type.
                 targetRoom = findAvailableRoom(s, newStart, newEnd, requiredRoomType,
-                        availableCandidateRooms, extraRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date);
+                        availableCandidateRooms, extraRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date, strategy);
                 if (targetRoom != null) {
                     action = ScheduleOverride.Action.ROOM_CHANGE;
                     if (extraRooms != null && extraRooms.contains(targetRoom)) {
@@ -345,8 +373,27 @@ public class RescheduleService {
                     }
                 }
             } else if (strategy == Strategy.TIME_SHIFT_FIRST) {
-                // Strategy B: Time Shift First (Preserve Venue where possible)
-                for (LocalTime[] slot : candidateSlots) {
+                // Strategy B: Time Shift to Open Periods (Preserve Specialized Lab Venues via Time Rescheduling)
+                // Evaluates alternative open grid periods first, pushing original slot to the end
+                List<LocalTime[]> shiftSlots = new ArrayList<>(candidateSlots);
+                shiftSlots.sort((sl1, sl2) -> {
+                    boolean isOrig1 = sl1[0].equals(s.getStartTime());
+                    boolean isOrig2 = sl2[0].equals(s.getStartTime());
+                    if (isOrig1 != isOrig2) {
+                        return isOrig1 ? 1 : -1; // Push original time slot to the very end
+                    }
+                    // For morning sessions, prioritize afternoon blocks (14:00-16:00, 15:00-17:00)
+                    if (s.getStartTime().getHour() < 12) {
+                        boolean isAfternoon1 = sl1[0].getHour() >= 14;
+                        boolean isAfternoon2 = sl2[0].getHour() >= 14;
+                        if (isAfternoon1 != isAfternoon2) {
+                            return isAfternoon1 ? -1 : 1;
+                        }
+                    }
+                    return sl1[0].compareTo(sl2[0]);
+                });
+
+                for (LocalTime[] slot : shiftSlots) {
                     if (isTimeOverlap(slot[0], slot[1], LocalTime.of(11, 0), LocalTime.of(11, 15)) ||
                             isTimeOverlap(slot[0], slot[1], LocalTime.of(13, 15), LocalTime.of(14, 0))) {
                         continue; // Skip recess / lunch
@@ -356,30 +403,29 @@ public class RescheduleService {
                     boolean groupsFree = isGroupsFree(s.getGroups(), slot[0], slot[1], unaffectedSessions, overrides);
 
                     if (facultyFree && groupsFree) {
-                        // First check if original venue can be preserved
-                        if (s.getRoom() != null && isRoomAvailable(s.getRoom(), slot[0], slot[1], unaffectedSessions, overrides, disruptions, date)) {
+                        // If not the original slot, check if original venue is available at the new time
+                        if (!slot[0].equals(s.getStartTime()) && s.getRoom() != null && isRoomAvailable(s.getRoom(), slot[0], slot[1], unaffectedSessions, overrides, disruptions, date)) {
                             targetRoom = s.getRoom();
                             newStart = slot[0];
                             newEnd = slot[1];
                             action = ScheduleOverride.Action.MOVE;
-                            reason = baseDisruptionReason + " (Rescheduled to afternoon slot due to lack of vacant lab at 09:00)";
+                            reason = baseDisruptionReason + " (Rescheduled to open period " + newStart + "-" + newEnd + " preserving original venue " + targetRoom.getCode() + ")";
                             break;
                         } else {
                             Room candidateRoom = findAvailableRoom(s, slot[0], slot[1], requiredRoomType,
-                                    availableCandidateRooms, extraRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date);
+                                    availableCandidateRooms, extraRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date, strategy);
                             if (candidateRoom != null) {
                                 targetRoom = candidateRoom;
                                 newStart = slot[0];
                                 newEnd = slot[1];
-                                action = (s.getStartTime().equals(newStart) && s.getEndTime().equals(newEnd))
-                                        ? ScheduleOverride.Action.ROOM_CHANGE : ScheduleOverride.Action.MOVE;
-                                if (extraRooms != null && extraRooms.contains(candidateRoom)) {
+                                boolean isSameTime = s.getStartTime().equals(newStart) && s.getEndTime().equals(newEnd);
+                                action = isSameTime ? ScheduleOverride.Action.ROOM_CHANGE : ScheduleOverride.Action.MOVE;
+                                if (!isSameTime) {
+                                    reason = baseDisruptionReason + " (Rescheduled to open period " + newStart + "-" + newEnd + " to ensure dedicated laboratory access)";
+                                } else if (extraRooms != null && extraRooms.contains(candidateRoom)) {
                                     reason = "Accommodated in temporary extra venue " + (candidateRoom.getName() != null ? candidateRoom.getName() : candidateRoom.getCode()) + " to prevent session cancellation";
                                 } else if (candidateRoom.getRoomType() == Room.RoomType.CLASSROOM && isLab) {
-                                    reason = "Lab Hours Adjustment Rule applied: Converted to theory lecture in " + (candidateRoom.getName() != null ? candidateRoom.getName() : candidateRoom.getCode())
-                                            + (action == ScheduleOverride.Action.ROOM_CHANGE ? " due to lack of vacant lab" : " (rescheduled)");
-                                } else if (action == ScheduleOverride.Action.MOVE) {
-                                    reason = baseDisruptionReason + " (Rescheduled to afternoon slot due to lack of vacant lab at 09:00)";
+                                    reason = "Lab Hours Adjustment Rule applied: Converted to theory lecture in " + (candidateRoom.getName() != null ? candidateRoom.getName() : candidateRoom.getCode()) + " due to lack of vacant lab";
                                 } else {
                                     reason = baseDisruptionReason;
                                 }
@@ -389,56 +435,78 @@ public class RescheduleService {
                     }
                 }
             } else if (strategy == Strategy.BALANCED) {
-                // Strategy C: Balanced Group Continuity
-                // 1. For labs: Always prioritize room swap at same time to protect 2-hour practical batch blocks
-                if (isLab && !isFacultyAbsent) {
+                // Strategy C: Balanced Group Continuity & Departmental Lab Quality
+                String subj = (s.getSubject() != null && s.getSubject().getCode() != null)
+                        ? s.getSubject().getCode().toUpperCase() : "";
+                boolean isSeminarOrProject = subj.contains("EDI") || subj.contains("SEM")
+                        || subj.contains("PROJ") || subj.contains("PBL");
+
+                // 1. For Seminar / Project / Presentation sessions:
+                // Accommodate in seminar hall or KRC at original time (ROOM_CHANGE)
+                if (isSeminarOrProject && !isFacultyAbsent) {
                     targetRoom = findAvailableRoom(s, newStart, newEnd, requiredRoomType,
-                            availableCandidateRooms, extraRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date);
+                            availableCandidateRooms, extraRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date, strategy);
                     if (targetRoom != null) {
                         action = ScheduleOverride.Action.ROOM_CHANGE;
                         if (extraRooms != null && extraRooms.contains(targetRoom)) {
                             reason = "Accommodated in temporary extra venue " + (targetRoom.getName() != null ? targetRoom.getName() : targetRoom.getCode()) + " to prevent session cancellation";
-                        } else if (targetRoom.getRoomType() == Room.RoomType.CLASSROOM && isLab) {
-                            reason = "Lab Hours Adjustment Rule applied: Converted to theory lecture in " + (targetRoom.getName() != null ? targetRoom.getName() : targetRoom.getCode()) + " due to lack of vacant lab";
                         } else {
                             reason = baseDisruptionReason;
                         }
                     }
                 }
 
-                // 2. For lectures or fallback: check adjacent contiguous periods to avoid idle gap hours for students
+                // 2. For Practical Coding Labs:
+                // Step A: Prefer dedicated departmental lab (A1-301, B-108, A-209, A-210, A-211, A-212) at the SAME time slot!
+                if (targetRoom == null && isLab && !isFacultyAbsent) {
+                    Room deptLab = findAvailableDepartmentalLab(s, newStart, newEnd,
+                            availableCandidateRooms, unaffectedSessions, overrides, disruptions, date);
+                    if (deptLab != null) {
+                        targetRoom = deptLab;
+                        action = ScheduleOverride.Action.ROOM_CHANGE;
+                        reason = baseDisruptionReason + " (Relocated to departmental laboratory " + deptLab.getCode() + ")";
+                    }
+                }
+
+                // Step B: If no departmental lab is available at same time, check adjacent contiguous afternoon slot (e.g. 14:00-16:00)
+                // so students get hands-on lab access without disjoint dead gaps in their schedule!
                 if (targetRoom == null) {
-                    for (LocalTime[] slot : candidateSlots) {
+                    List<LocalTime[]> balancedSlots = new ArrayList<>(candidateSlots);
+                    balancedSlots.sort((sl1, sl2) -> {
+                        boolean isOrig1 = sl1[0].equals(s.getStartTime());
+                        boolean isOrig2 = sl2[0].equals(s.getStartTime());
+                        if (isOrig1 != isOrig2) {
+                            return isOrig1 ? 1 : -1;
+                        }
+                        boolean adj1 = isAdjacentToExistingGroupClass(s.getGroups(), sl1[0], sl1[1], unaffectedSessions);
+                        boolean adj2 = isAdjacentToExistingGroupClass(s.getGroups(), sl2[0], sl2[1], unaffectedSessions);
+                        if (adj1 != adj2) {
+                            return adj1 ? -1 : 1;
+                        }
+                        return sl1[0].compareTo(sl2[0]);
+                    });
+
+                    for (LocalTime[] slot : balancedSlots) {
                         if (isTimeOverlap(slot[0], slot[1], LocalTime.of(11, 0), LocalTime.of(11, 15)) ||
                                 isTimeOverlap(slot[0], slot[1], LocalTime.of(13, 15), LocalTime.of(14, 0))) {
                             continue;
                         }
-
-                        // Prefer contiguous slot adjacent to an existing class for this division
-                        boolean isAdjacent = isAdjacentToExistingGroupClass(s.getGroups(), slot[0], slot[1], unaffectedSessions);
-                        if (!isAdjacent && !candidateSlots.get(0).equals(slot)) {
-                            continue; // In first pass, only pick contiguous adjacent slot
-                        }
-
                         boolean facultyFree = isFacultyFree(s.getFaculty(), slot[0], slot[1], unaffectedSessions, overrides, disruptions, date);
                         boolean groupsFree = isGroupsFree(s.getGroups(), slot[0], slot[1], unaffectedSessions, overrides);
 
                         if (facultyFree && groupsFree) {
-                            Room candidateRoom = findAvailableRoom(s, slot[0], slot[1], requiredRoomType,
-                                    availableCandidateRooms, extraRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date);
+                            Room candidateRoom = isLab
+                                    ? findAvailableDepartmentalLab(s, slot[0], slot[1], availableCandidateRooms, unaffectedSessions, overrides, disruptions, date)
+                                    : findAvailableRoom(s, slot[0], slot[1], requiredRoomType, availableCandidateRooms, extraRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date, strategy);
+
                             if (candidateRoom != null) {
                                 targetRoom = candidateRoom;
                                 newStart = slot[0];
                                 newEnd = slot[1];
-                                action = (s.getStartTime().equals(newStart) && s.getEndTime().equals(newEnd))
-                                        ? ScheduleOverride.Action.ROOM_CHANGE : ScheduleOverride.Action.MOVE;
-                                if (extraRooms != null && extraRooms.contains(candidateRoom)) {
-                                    reason = "Accommodated in temporary extra venue " + (candidateRoom.getName() != null ? candidateRoom.getName() : candidateRoom.getCode()) + " to prevent session cancellation";
-                                } else if (candidateRoom.getRoomType() == Room.RoomType.CLASSROOM && isLab) {
-                                    reason = "Lab Hours Adjustment Rule applied: Converted to theory lecture in " + (candidateRoom.getName() != null ? candidateRoom.getName() : candidateRoom.getCode())
-                                            + (action == ScheduleOverride.Action.ROOM_CHANGE ? " due to lack of vacant lab" : " (rescheduled)");
-                                } else if (action == ScheduleOverride.Action.MOVE) {
-                                    reason = baseDisruptionReason + " (Rescheduled to afternoon slot due to lack of vacant lab at 09:00)";
+                                boolean isSameTime = s.getStartTime().equals(newStart) && s.getEndTime().equals(newEnd);
+                                action = isSameTime ? ScheduleOverride.Action.ROOM_CHANGE : ScheduleOverride.Action.MOVE;
+                                if (!isSameTime) {
+                                    reason = baseDisruptionReason + " (Rescheduled to adjacent period " + newStart + "-" + newEnd + " for departmental laboratory access)";
                                 } else {
                                     reason = baseDisruptionReason;
                                 }
@@ -448,10 +516,10 @@ public class RescheduleService {
                     }
                 }
 
-                // 3. Fallback for balanced: try same-time room swap if not already tried
+                // Step C: Fallback to general room search if neither same-time nor adjacent departmental lab was found
                 if (targetRoom == null && !isFacultyAbsent) {
                     targetRoom = findAvailableRoom(s, newStart, newEnd, requiredRoomType,
-                            availableCandidateRooms, extraRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date);
+                            availableCandidateRooms, extraRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date, strategy);
                     if (targetRoom != null) {
                         action = ScheduleOverride.Action.ROOM_CHANGE;
                         if (extraRooms != null && extraRooms.contains(targetRoom)) {
@@ -477,7 +545,7 @@ public class RescheduleService {
 
                     if (facultyFree && groupsFree) {
                         Room candidateRoom = findAvailableRoom(s, slot[0], slot[1], requiredRoomType,
-                                availableCandidateRooms, extraRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date);
+                                availableCandidateRooms, extraRooms, unaffectedSessions, overrides, disruptions, roomPolicies, date, strategy);
                         if (candidateRoom != null) {
                             targetRoom = candidateRoom;
                             newStart = slot[0];
@@ -617,7 +685,13 @@ public class RescheduleService {
             LocalTime slotStart,
             LocalTime slotEnd,
             List<TimetableSession> unaffectedSessions) {
+        if (groups == null || groups.isEmpty() || unaffectedSessions == null) {
+            return false;
+        }
         return unaffectedSessions.stream().anyMatch(s -> {
+            if (s.getGroups() == null || s.getStartTime() == null || s.getEndTime() == null) {
+                return false;
+            }
             boolean sharesGroup = s.getGroups().stream().anyMatch(sg ->
                     groups.stream().anyMatch(g -> groupsOverlap(g, sg)));
             if (!sharesGroup) return false;
@@ -649,6 +723,34 @@ public class RescheduleService {
         });
     }
 
+    private Room findAvailableDepartmentalLab(
+            TimetableSession session,
+            LocalTime start,
+            LocalTime end,
+            List<Room> allRooms,
+            List<TimetableSession> unaffectedSessions,
+            List<ScheduleOverride> generatedOverrides,
+            List<Disruption> disruptions,
+            LocalDate date) {
+        for (Room room : allRooms) {
+            if (!room.isActive()) continue;
+            if (room.getRoomType() != Room.RoomType.LAB) continue;
+            String code = room.getCode() != null ? room.getCode().toUpperCase() : "";
+            // Strictly exclude reading halls (KRC) and seminar halls / auditoriums
+            if (code.contains("KRC") || code.contains("SEM") || code.contains("HALL") || code.contains("AUD")) {
+                continue;
+            }
+            if (session.getRoom() != null && session.getRoom().getId().equals(room.getId()) &&
+                    start.equals(session.getStartTime()) && end.equals(session.getEndTime())) {
+                continue;
+            }
+            if (isRoomAvailable(room, start, end, unaffectedSessions, generatedOverrides, disruptions, date)) {
+                return room;
+            }
+        }
+        return null;
+    }
+
     private Room findAvailableRoom(
             TimetableSession session,
             LocalTime start,
@@ -660,15 +762,30 @@ public class RescheduleService {
             List<ScheduleOverride> generatedOverrides,
             List<Disruption> disruptions,
             List<RoomPolicyOverride> roomPolicies,
-            LocalDate date) {
+            LocalDate date,
+            Strategy strategy) {
 
         String subjCode = (session.getSubject() != null && session.getSubject().getCode() != null)
                 ? session.getSubject().getCode().toUpperCase() : "";
         boolean isSeminarOrProject = subjCode.contains("EDI") || subjCode.contains("SEM")
                 || subjCode.contains("PROJ") || subjCode.contains("PBL");
 
+        List<Room> searchRooms = new ArrayList<>(allRooms);
+        if (strategy == Strategy.BALANCED) {
+            // For Plan C (Balanced): prioritize dedicated computer labs (e.g. A1-301, B-108, A-209, A-210, A-211, A-212)
+            // over general multi-purpose facilities like KRC, so genuine computer laboratories are matched first
+            searchRooms.sort((r1, r2) -> {
+                boolean isKrc1 = "KRC".equalsIgnoreCase(r1.getCode());
+                boolean isKrc2 = "KRC".equalsIgnoreCase(r2.getCode());
+                if (isKrc1 != isKrc2) {
+                    return isKrc1 ? 1 : -1;
+                }
+                return r1.getCode().compareTo(r2.getCode());
+            });
+        }
+
         // 1. Primary pass: match required room type exactly (e.g. LAB -> LAB, CLASSROOM -> CLASSROOM)
-        for (Room room : allRooms) {
+        for (Room room : searchRooms) {
             if (!room.isActive()) continue;
             if (room.getRoomType() != requiredType) continue;
             if (session.getRoom() != null && session.getRoom().getId().equals(room.getId()) &&

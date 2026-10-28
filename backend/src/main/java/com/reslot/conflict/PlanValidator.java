@@ -118,7 +118,17 @@ public class PlanValidator {
 
                 if (s1.room() != null && s2.room() != null && s1.room().getId().equals(s2.room().getId())) {
                     if (isTimeOverlap(s1.startTime(), s1.endTime(), s2.startTime(), s2.endTime())) {
-                        boolean isNew = s1.isModified() || s2.isModified();
+                        boolean wasInMaster = s1.originalSession().getRoom() != null
+                                && s2.originalSession().getRoom() != null
+                                && s1.originalSession().getRoom().getId().equals(s2.originalSession().getRoom().getId())
+                                && s1.originalSession().getRoom().getId().equals(s1.room().getId())
+                                && s1.startTime().equals(s1.originalSession().getStartTime())
+                                && s1.endTime().equals(s1.originalSession().getEndTime())
+                                && s2.startTime().equals(s2.originalSession().getStartTime())
+                                && s2.endTime().equals(s2.originalSession().getEndTime())
+                                && isTimeOverlap(s1.originalSession().getStartTime(), s1.originalSession().getEndTime(),
+                                                 s2.originalSession().getStartTime(), s2.originalSession().getEndTime());
+                        boolean isNew = !wasInMaster;
                         if (isNew) {
                             newClashes++;
                             findings.add(createFinding("ROOM_COLLISION", "ERROR", false,
@@ -149,7 +159,15 @@ public class PlanValidator {
                     for (Faculty f1 : s1.faculty()) {
                         for (Faculty f2 : s2.faculty()) {
                             if (f1.getId().equals(f2.getId())) {
-                                boolean isNew = s1.isModified() || s2.isModified();
+                                boolean wasInMaster = s1.originalSession().getFaculty().stream().anyMatch(mf1 -> mf1.getId().equals(f1.getId()))
+                                        && s2.originalSession().getFaculty().stream().anyMatch(mf2 -> mf2.getId().equals(f1.getId()))
+                                        && s1.startTime().equals(s1.originalSession().getStartTime())
+                                        && s1.endTime().equals(s1.originalSession().getEndTime())
+                                        && s2.startTime().equals(s2.originalSession().getStartTime())
+                                        && s2.endTime().equals(s2.originalSession().getEndTime())
+                                        && isTimeOverlap(s1.originalSession().getStartTime(), s1.originalSession().getEndTime(),
+                                                         s2.originalSession().getStartTime(), s2.originalSession().getEndTime());
+                                boolean isNew = !wasInMaster;
                                 if (isNew) {
                                     newClashes++;
                                     findings.add(createFinding("FACULTY_DOUBLE_BOOKING", "ERROR", false,
@@ -186,7 +204,15 @@ public class PlanValidator {
                     for (StudentGroup g1 : s1.groups()) {
                         for (StudentGroup g2 : s2.groups()) {
                             if (groupsOverlap(g1, g2)) {
-                                boolean isNew = s1.isModified() || s2.isModified();
+                                boolean wasInMaster = s1.originalSession().getGroups().stream().anyMatch(mg1 ->
+                                        s2.originalSession().getGroups().stream().anyMatch(mg2 -> groupsOverlap(mg1, mg2)))
+                                        && s1.startTime().equals(s1.originalSession().getStartTime())
+                                        && s1.endTime().equals(s1.originalSession().getEndTime())
+                                        && s2.startTime().equals(s2.originalSession().getStartTime())
+                                        && s2.endTime().equals(s2.originalSession().getEndTime())
+                                        && isTimeOverlap(s1.originalSession().getStartTime(), s1.originalSession().getEndTime(),
+                                                         s2.originalSession().getStartTime(), s2.originalSession().getEndTime());
+                                boolean isNew = !wasInMaster;
                                 if (isNew) {
                                     newClashes++;
                                     findings.add(createFinding("GROUP_COLLISION", "ERROR", false,
